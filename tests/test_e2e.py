@@ -400,3 +400,257 @@ def test_path_traversal_rejected(proxy):
     with client() as c:
         r = c.get(f"{proxy.url}/packages/..%2f..%2fetc%2fpasswd")
     assert r.status_code in (400, 404)
+
+
+# --------------------------------------------------------------------- #
+# origin metadata recovery: custom packages on the volume, backfill,     #
+# generation-safe swaps (standalone origin with a pre-populated volume)  #
+# --------------------------------------------------------------------- #
+
+
+class OriginRunner:
+    def __init__(self, pkg_dir: Path, log: Path, control: Path, env_extra=None):
+        self.pkg_dir = pkg_dir
+        self.log = log
+        self.control = control
+        self.env_extra = env_extra or {}
+        self.proc: subprocess.Popen | None = None
+        self.url = ""
+
+    def start(self) -> None:
+        port = free_port()
+        if self.control.exists():
+            self.control.unlink()
+        self.proc = start_server(
+            "origin", port, {"PKG_DIR": str(self.pkg_dir), **self.env_extra},
+            self.log, self.control,
+        )
+        self.url = f"http://127.0.0.1:{port}"
+
+    def restart(self) -> None:
+        stop(self.proc, self.control)
+        self.start()
+
+    def stop(self) -> None:
+        stop(self.proc, self.control)
+
+
+@pytest.fixture()
+def origin_standalone(tmp_path):
+    pkg_dir = tmp_path / "pkgs"
+    pkg_dir.mkdir(parents=True)
+    runner = OriginRunner(
+        pkg_dir, tmp_path / "origin.log", tmp_path / "origin.stop"
+    )
+    yield runner
+    runner.stop()
+
+
+def _wait_digest(stats_url: str, key: str, timeout: float = 30.0) -> dict:
+    deadline = time.monotonic() + timeout
+    last = {}
+    while time.monotonic() < deadline:
+        with client() as c:
+            last = c.get(stats_url).json()
+        info = last["packages"].get(key)
+        if info and info["sha256"]:
+            return info
+        time.sleep(0.05)
+    raise AssertionError(f"digest for {key} never backfilled: {last}")
+
+
+def test_origin_recovers_custom_packages_after_restart(origin_standalone, tmp_path):
+    # Simulate packages left on the volume by a previous build team, including
+    # one in a subdirectory; origin never saw them before restart.
+    pkg_dir = origin_standalone.pkg_dir
+    sub = pkg_dir / "team-x" / "libs"
+    sub.mkdir(parents=True)
+    custom = b"custom-build-artifact-" + os.urandom(200_000)
+    nested = b"nested-package-" + os.urandom(50_000)
+    (pkg_dir / "custom-1.bin").write_bytes(custom)
+    (sub / "widget-7.tar.gz").write_bytes(nested)
+    want_custom = sha256(custom)
+    want_nested = sha256(nested)
+
+    origin_standalone.start()
+
+    # Downloads keep working and carry the digest of the served bytes.
+    got = download_bytes(origin_standalone.url, "custom-1.bin")
+    assert got == custom
+    with client() as c:
+        r = c.get(f"{origin_standalone.url}/packages/custom-1.bin")
+    assert r.headers["x-package-sha256"] == want_custom
+
+    got_nested = download_bytes(origin_standalone.url, "team-x/libs/widget-7.tar.gz")
+    assert got_nested == nested
+    with client() as c:
+        r = c.get(f"{origin_standalone.url}/packages/team-x/libs/widget-7.tar.gz")
+    assert r.headers["x-package-sha256"] == want_nested
+
+    # Stats list every volume package, nested paths included, with current
+    # size and digest.
+    info_custom = _wait_digest(f"{origin_standalone.url}/control/stats", "custom-1.bin")
+    info_nested = _wait_digest(
+        f"{origin_standalone.url}/control/stats", "team-x/libs/widget-7.tar.gz"
+    )
+    assert info_custom == {"size": len(custom), "sha256": want_custom}
+    assert info_nested == {"size": len(nested), "sha256": want_nested}
+
+    # Restart: same volume, metadata must be recovered again.
+    origin_standalone.restart()
+    with client() as c:
+        r = c.get(f"{origin_standalone.url}/packages/custom-1.bin")
+    assert r.status_code == 200
+    assert r.headers["x-package-sha256"] == want_custom
+    stats = origin_stats(origin_standalone.url)
+    assert stats["packages"]["team-x/libs/widget-7.tar.gz"] == {
+        "size": len(nested),
+        "sha256": want_nested,
+    }
+
+
+def test_origin_startup_does_not_wait_for_backfill(origin_standalone, tmp_path):
+    # Several large files on the volume: hashing all of them takes noticeably
+    # longer than a healthy boot, yet the origin must serve /healthz promptly.
+    pkg_dir = origin_standalone.pkg_dir
+    big = 96 * MIB
+    for i in range(6):
+        (pkg_dir / f"big-{i}.bin").write_bytes(b"\0" * big)
+
+    t0 = time.monotonic()
+    origin_standalone.start()
+    boot = time.monotonic() - t0
+    assert boot < 5.0, f"startup blocked on digest backfill for {boot:.1f}s"
+
+    # Immediately after boot the backlog may still be pending (sha256 null) or
+    # already done on fast machines; either way every digest eventually
+    # converges to the real file hash.
+    stats = origin_stats(origin_standalone.url)
+    pending = [
+        k for k, v in stats["packages"].items()
+        if k.startswith("big-") and not v["sha256"]
+    ]
+    for i in range(6):
+        info = _wait_digest(
+            f"{origin_standalone.url}/control/stats", f"big-{i}.bin", timeout=60
+        )
+        assert info["size"] == big
+        assert info["sha256"] == sha256(b"\0" * big)
+    if not pending:
+        print("\nbackfill already finished before first stats poll (fast host)")
+
+
+def test_repeated_downloads_reuse_backfilled_digest(origin_standalone):
+    pkg_dir = origin_standalone.pkg_dir
+    blob = os.urandom(300_000)
+    (pkg_dir / "reuse.bin").write_bytes(blob)
+    want = sha256(blob)
+    origin_standalone.start()
+
+    # First download triggers/awaits the backfill...
+    with client() as c:
+        r1 = c.get(f"{origin_standalone.url}/packages/reuse.bin")
+        assert r1.headers["x-package-sha256"] == want
+        # ...and every later download reuses the cached digest for the version.
+        r2 = c.get(f"{origin_standalone.url}/packages/reuse.bin")
+        r3 = c.get(f"{origin_standalone.url}/packages/reuse.bin")
+    assert r2.headers["x-package-sha256"] == want
+    assert r3.headers["x-package-sha256"] == want
+    assert r1.content == r2.content == blob
+
+    info = _wait_digest(f"{origin_standalone.url}/control/stats", "reuse.bin")
+    assert info == {"size": len(blob), "sha256": want}
+
+
+def test_swap_during_backfill_wins_and_late_digest_is_discarded(
+    origin_standalone, tmp_path
+):
+    # One slow-to-hash file keeps the backfill busy while a new version is
+    # published at the same path.
+    pkg_dir = origin_standalone.pkg_dir
+    big = b"\xa5" * (128 * MIB)
+    (pkg_dir / "rolling.bin").write_bytes(big)
+    origin_standalone.env_extra["DIGEST_WORKERS"] = "1"
+    origin_standalone.start()
+
+    # Wait until the backfill is actually in flight (stats shows the package
+    # with a null digest), then publish a new, small version.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        stats = origin_stats(origin_standalone.url)
+        if "rolling.bin" in stats["packages"]:
+            break
+        time.sleep(0.05)
+
+    with client() as c:
+        swapped = c.post(
+            f"{origin_standalone.url}/control/content/rolling.bin",
+            params={"size": 123_456},
+        ).json()
+    new_sha = swapped["sha256"]
+    assert new_sha != sha256(big)
+
+    # New downloads and stats immediately reflect the new version; wait long
+    # enough for the stale backfill of the 128MiB file to finish afterwards.
+    time.sleep(2.0)
+    with client() as c:
+        r = c.get(f"{origin_standalone.url}/packages/rolling.bin")
+    assert r.status_code == 200
+    assert r.headers["x-package-sha256"] == new_sha
+    assert sha256(r.content) == new_sha
+    assert len(r.content) == 123_456
+
+    stats = origin_stats(origin_standalone.url)
+    assert stats["packages"]["rolling.bin"] == {
+        "size": 123_456,
+        "sha256": new_sha,
+    }
+
+    # The on-disk file is the new version; no stale content leaked through.
+    assert sha256((pkg_dir / "rolling.bin").read_bytes()) == new_sha
+
+
+def test_swap_then_download_and_stats_serve_new_version(origin_standalone):
+    pkg_dir = origin_standalone.pkg_dir
+    first = os.urandom(256 * 1024)
+    (pkg_dir / "swap.bin").write_bytes(first)
+    origin_standalone.start()
+    old_sha = sha256(first)
+
+    # Let the original version finish backfilling.
+    info = _wait_digest(f"{origin_standalone.url}/control/stats", "swap.bin")
+    assert info["sha256"] == old_sha
+
+    with client() as c:
+        resp = c.post(f"{origin_standalone.url}/control/content/swap.bin").json()
+    new_sha = resp["sha256"]
+    assert new_sha != old_sha
+
+    with client() as c:
+        r = c.get(f"{origin_standalone.url}/packages/swap.bin")
+    assert r.headers["x-package-sha256"] == new_sha
+    assert sha256(r.content) == new_sha
+
+    stats = origin_stats(origin_standalone.url)
+    assert stats["packages"]["swap.bin"] == {
+        "size": len(r.content),
+        "sha256": new_sha,
+    }
+
+
+def test_stats_handles_out_of_band_file_replacement(origin_standalone):
+    pkg_dir = origin_standalone.pkg_dir
+    (pkg_dir / "oob.bin").write_bytes(b"v1" * 1000)
+    origin_standalone.start()
+    _wait_digest(f"{origin_standalone.url}/control/stats", "oob.bin")
+
+    # Replace the file directly on the volume (no control API involved).
+    new_blob = b"v2-content" * 5000
+    (pkg_dir / "oob.bin").write_bytes(new_blob)
+    origin_stats(origin_standalone.url)  # trigger out-of-band re-registration
+    info = _wait_digest(f"{origin_standalone.url}/control/stats", "oob.bin")
+    assert info == {"size": len(new_blob), "sha256": sha256(new_blob)}
+    with client() as c:
+        r = c.get(f"{origin_standalone.url}/packages/oob.bin")
+    assert r.headers["x-package-sha256"] == sha256(new_blob)
+    assert r.content == new_blob
